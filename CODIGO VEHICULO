@@ -1,0 +1,198 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <Wire.h>
+
+// Definiciones de pines
+#define SS 53
+#define RST 9
+#define DIO0 2
+#define LED_LORA 13 // Pin para el LED de LoRa
+
+// Pines para motores y otros periféricos
+const int motorA1 = 3;
+const int motorA2 = 4;
+const int motorB1 = 5;
+const int motorB2 = 7;
+const int ENA = 11;    // Pin de habilitación para el motor A
+const int ENB = 12;    // Pin de habilitación para el motor B
+const int buzzerPin = 43;
+const int camaraPin = 41 ;
+const int led1 = 46;
+const int led2 = 47;
+const int led3 = 48;
+const int ledPWM = 6;  // Pin para el LED con control PWM
+const int sensorVoltajePin = A0; // Pin de lectura del sensor de voltaje
+
+// Velocidad constante para el eje X
+const int VELOCIDAD_X = 255;
+
+// Variables de control
+unsigned long lastVoltageSendTime = 0;
+const unsigned long voltageInterval = 5000; // Intervalo de 5 segundos para enviar voltaje
+
+// Definiciones de tiempo
+const unsigned long TIMEOUT_PERIOD = 5000; // 10 segundos de espera
+unsigned long lastReceivedTime = 0; // Tiempo de la última recepción
+
+// Variables para la conversión de voltaje
+const int voltajeMax = 25000; // 25V -> 25000mV
+float voltaje;
+float offset = 0; // Ajuste de calibración
+
+// Estructura para los datos de control
+struct ControlData {
+  char ejePrioritario;
+  int valorEje;
+  int potValue;
+  int motorSpeed;
+  int switch1;
+  int switch2;
+  int switch3;
+};
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_LORA, OUTPUT);
+
+  // Configuración de pines como salidas
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(camaraPin, OUTPUT);
+  pinMode(led1, OUTPUT);
+  pinMode(led2, OUTPUT);
+  pinMode(led3, OUTPUT);
+  pinMode(ledPWM, OUTPUT);
+  pinMode(motorA1, OUTPUT);
+  pinMode(motorA2, OUTPUT);
+  pinMode(motorB1, OUTPUT);
+  pinMode(motorB2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  // Inicialización de LoRa
+  LoRa.setPins(SS, RST, DIO0);
+  while (!LoRa.begin(433E6)) {
+    Serial.println("LoRa init failed. Retrying...");
+    delay(1000);
+  }
+  LoRa.setTxPower(20);
+  LoRa.setSyncWord(0x2C);
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Verificar si ha pasado el tiempo de espera
+  if (currentTime - lastReceivedTime >= TIMEOUT_PERIOD) {
+    Serial.println("No se han recibido datos. Reiniciando...");
+    asm volatile ("  jmp 0"); // Reiniciar el programa
+  }
+
+  if (currentTime - lastVoltageSendTime >= voltageInterval) {
+    sendVoltageData();
+    lastVoltageSendTime = currentTime;
+  }
+  
+  receiveControlData();
+  delay(10);
+}
+
+void sendVoltageData() {
+  int lecturaDigital = analogRead(sensorVoltajePin);
+  voltaje = (lecturaDigital / 1023.0) * voltajeMax / 1000.0 + offset;
+  String dataToSend = "R:" + String(voltaje, 2) + "V";
+  LoRa.beginPacket();
+  LoRa.print(dataToSend);
+  LoRa.endPacket();
+  Serial.print("Voltaje enviado: ");
+  Serial.println(dataToSend);
+}
+
+void receiveControlData() {
+  if (LoRa.parsePacket()) {
+    byte packetType = LoRa.read();
+    if (packetType == 0x01) {
+      ControlData receivedData;
+      LoRa.readBytes((byte*)&receivedData, sizeof(ControlData));
+      Serial.print("Datos de control recibidos: ");
+      Serial.print(receivedData.ejePrioritario);
+      Serial.print(",");
+      Serial.print(receivedData.valorEje);
+      Serial.print(",");
+      Serial.print(receivedData.potValue);
+      Serial.print(",");
+      Serial.print(receivedData.motorSpeed);
+      Serial.print(",");
+      Serial.print(receivedData.switch1);
+      Serial.print(",");
+      Serial.print(receivedData.switch2);
+      Serial.print(",");
+      Serial.println(receivedData.switch3);
+      
+      // Actualizar el tiempo de la última recepción
+      lastReceivedTime = millis();
+      
+      controlMotores(receivedData);
+      controlarPerifericos(receivedData);
+      digitalWrite(LED_LORA, HIGH);
+    }
+  } else {
+    digitalWrite(LED_LORA, LOW);
+  }
+}
+
+void controlMotores(ControlData data) {
+  if (data.valorEje == 0) {
+    detenerMotores();
+    return;
+  }
+
+  int velocidad = (data.ejePrioritario == 'X') ? VELOCIDAD_X : data.motorSpeed;
+  analogWrite(ENA, velocidad);
+  analogWrite(ENB, velocidad);
+
+  if (data.ejePrioritario == 'X') {
+    if (data.valorEje > 0) {
+      digitalWrite(motorA1, LOW);
+      digitalWrite(motorA2, HIGH);
+      digitalWrite(motorB1, HIGH);
+      digitalWrite(motorB2, LOW);
+    } else {
+      digitalWrite(motorA1, HIGH);
+      digitalWrite(motorA2, LOW);
+      digitalWrite(motorB1, LOW);
+      digitalWrite(motorB2, HIGH);
+    }
+  } else if (data.ejePrioritario == 'Y') {
+    if (data.valorEje > 0) {
+      digitalWrite(motorA1, LOW);
+      digitalWrite(motorA2, HIGH);
+      digitalWrite(motorB1, LOW);
+      digitalWrite(motorB2, HIGH);
+    } else {
+      digitalWrite(motorA1, HIGH);
+      digitalWrite(motorA2, LOW);
+      digitalWrite(motorB1, HIGH);
+      digitalWrite(motorB2, LOW);
+    }
+  } else {
+    detenerMotores();
+  }
+}
+
+void detenerMotores() {
+  digitalWrite(motorA1, LOW);
+  digitalWrite(motorA2, LOW);
+  digitalWrite(motorB1, LOW);
+  digitalWrite(motorB2, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void controlarPerifericos(ControlData data) {
+  digitalWrite(buzzerPin, data.switch1 ? HIGH : LOW);
+  digitalWrite(camaraPin, data.switch2 ? HIGH : LOW);
+  digitalWrite(led1, data.switch3);
+  digitalWrite(led2, data.switch3);
+  digitalWrite(led3, data.switch3);
+  analogWrite(ledPWM, data.potValue);
+}
