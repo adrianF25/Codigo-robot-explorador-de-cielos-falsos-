@@ -1,0 +1,330 @@
+#define SS 10
+#define RST 9
+#define DIO0 2
+#define LED_LORA 6
+const int joyY = A2;
+const int joyX = A3;
+const int potPin = A0;
+const int potPWM = A1;  // Nuevo potenciómetro para el control PWM
+const int switchPin1 = 3;
+const int switchPin2 = 4;
+const int switchPin3 = 5;
+
+unsigned long lastSequenceNumber = 0;
+unsigned long paqueteEnviadoRecientemente = 0;
+const unsigned long tiempoEntrePaquetes = 200;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+byte battery[8] = {
+  0b00000,
+  0b00000,
+  0b01110,
+  0b11111,
+  0b11111,
+  0b11111,
+  0b01110,
+  0b00000
+};
+
+struct ControlData {
+  char ejePrioritario;
+  int valorEje;
+  int potValue;
+  int potPWMValue;  // Nuevo valor del potenciómetro en A1
+  int switch1;
+  int switch2;
+  int switch3;
+  unsigned long secuencia;
+};
+
+// Variables para el voltaje y porcentaje de batería
+float receivedVoltage = 0.0;
+float batteryPercentage = 0.0;
+const int pinSensorVoltaje = A6; // Pin para el sensor de voltaje
+// Prototipos de funciones
+void readBatteryVoltage();
+void receiveSensorData();
+void updateLCD();
+void sendControlData();
+void setup() {
+  Serial.begin(9600);
+  pinMode(LED_LORA, OUTPUT);
+
+  Wire.begin();
+  lcd.begin();
+  lcd.backlight();
+  lcd.createChar(0, battery);
+
+  LoRa.setPins(SS, RST, DIO0);
+  for (int i = 0; i < 3; i++) {
+    if (LoRa.begin(433E6)) {
+      Serial.println("LoRa Init OK");
+      digitalWrite(LED_LORA, HIGH); // Indicamos que LoRa está listo
+      break;
+    } else {
+      Serial.println("LoRa Init Failed. Retrying...");
+      delay(2000);
+    }
+    if (i == 2) {
+      Serial.println("LoRa Init Failed after multiple retries.");
+      digitalWrite(LED_LORA, LOW);
+      while (1);
+    }
+  }
+  LoRa.setTxPower(20);
+  LoRa.setSyncWord(0x2C);
+  LoRa.enableCrc();
+}
+
+void loop() {
+  // Hacer que el LED parpadee continuamente
+  static unsigned long lastBlinkTime = 0;
+  const unsigned long blinkInterval = 500; // Intervalo de parpadeo en milisegundos
+  static bool ledState = false;
+
+  if (millis() - lastBlinkTime >= blinkInterval) {
+    ledState = !ledState;
+    digitalWrite(LED_LORA, ledState);  // Parpadeo continuo
+    lastBlinkTime = millis();
+  }
+
+  sendControlData();  // Enviar datos de control
+  receiveSensorData();  // Recibir datos de sensores
+  readBatteryVoltage();  // Leer voltaje de la batería
+  updateLCD();  // ***Actualizar la pantalla con la info de SKYM5***
+  delay(10);
+
+}
+
+void sendControlData() {
+  int yValue = analogRead(joyY);
+  int xValue = analogRead(joyX);
+
+  // Leer los interruptores antes de enviarlos
+  int switchState1 = digitalRead(switchPin1);
+  int switchState2 = digitalRead(switchPin2);
+  int switchState3 = digitalRead(switchPin3);
+
+  int potValue = analogRead(potPin);
+  int potPWMValue = analogRead(potPWM);  // Leer el nuevo potenciómetro
+
+  int controlX = map(xValue, 0, 1023, -100, 100);
+  int controlY = map(yValue, 0, 1023, -100, 100);
+  int controlPWMPot = map(potPWMValue, 0, 1023, 0, 255);  // Mapeo de A1 a 0-255
+  int controlPot = map(potValue, 0, 1023, 0, 255);
+
+  // Eliminar la zona muerta para los ejes del joystick
+  const int deadZone = 50;
+  controlX = (abs(controlX) > deadZone) ? controlX : 0;
+  controlY = (abs(controlY) > deadZone) ? controlY : 0;
+
+  static char lastEjePrioritario = '\0';
+  static int lastValorEje = 0;
+  static int lastPotValue = -1;
+  static int lastPotPWMValue = -1;
+  // Variables para el estado anterior de los interruptores
+  static int lastSwitchState1 = -1;
+  static int lastSwitchState2 = -1;
+  static int lastSwitchState3 = -1;
+
+  // Determinar eje prioritario
+  if (lastEjePrioritario == '\0') {
+    if (abs(controlX) > abs(controlY) && controlX != 0) {
+      lastEjePrioritario = 'X';
+      lastValorEje = controlX;
+    } else if (abs(controlY) > abs(controlX) && controlY != 0) {
+      lastEjePrioritario = 'Y';
+      lastValorEje = controlY;
+    }
+  } else if (lastEjePrioritario == 'X') {
+    if (controlX == 0) {
+      lastEjePrioritario = 'Y';
+      lastValorEje = controlY;
+    } else if (abs(controlX) > abs(controlY)) {
+      lastValorEje = controlX;
+    }
+  } else if (lastEjePrioritario == 'Y') {
+    if (controlY == 0) {
+      lastEjePrioritario = 'X';
+      lastValorEje = controlX;
+    } else if (abs(controlY) > abs(controlX)) {
+      lastValorEje = controlY;
+    }
+  }
+
+  // Enviar datos solo si hay cambios o si el valor es cero después de moverse
+  if (millis() - paqueteEnviadoRecientemente > tiempoEntrePaquetes) {
+    // Verificar si los valores de los interruptores han cambiado o si los joystick/potenciómetro han vuelto a cero
+    bool sendData = false;
+
+    // Verificar si el joystick (X o Y) ha cambiado o si el valor actual es cero
+    if (lastValorEje != controlX || lastValorEje != controlY || controlX == 0 || controlY == 0) {
+      sendData = true;
+    }
+
+    // Verificar si el potenciómetro ha cambiado o si el valor actual es cero
+    if (lastPotValue != controlPot || controlPot == 0) {
+      sendData = true;
+    }
+    if (lastPotPWMValue != controlPWMPot || controlPWMPot == 0) {
+      sendData = true;
+    }
+
+    // Verificar si los interruptores han cambiado
+    if (switchState1 != lastSwitchState1 || switchState2 != lastSwitchState2 || switchState3 != lastSwitchState3) {
+      sendData = true;
+    }
+
+    if (sendData) {
+      digitalWrite(LED_LORA, HIGH);  // Encender LED durante la transmisión
+
+      ControlData dataToSend;
+      dataToSend.ejePrioritario = lastEjePrioritario;
+      dataToSend.valorEje = lastValorEje;
+      dataToSend.potValue = controlPot;
+      dataToSend.potPWMValue = controlPWMPot;  // Agregar el valor de A1
+      dataToSend.switch1 = switchState1;
+      dataToSend.switch2 = switchState2;
+      dataToSend.switch3 = switchState3;
+      dataToSend.secuencia = ++lastSequenceNumber;
+
+      byte checksum = 0;
+      byte dataBuffer[sizeof(ControlData) + 1];
+      dataBuffer[0] = 0x01;
+      memcpy(dataBuffer + 1, &dataToSend, sizeof(ControlData));
+
+      for (int i = 0; i < sizeof(ControlData) + 1; i++) {
+        checksum ^= dataBuffer[i];
+      }
+      checksum = ~checksum;
+
+      LoRa.beginPacket();
+      LoRa.write(dataBuffer, sizeof(ControlData) + 1);
+      LoRa.write(checksum);
+      LoRa.endPacket();
+
+      Serial.print("Datos de control enviados: ");
+      Serial.print(dataToSend.ejePrioritario);
+      Serial.print(",");
+      Serial.print(dataToSend.valorEje);
+      Serial.print(",");
+      Serial.print(dataToSend.potValue);
+      Serial.print(",");
+      Serial.print(dataToSend.potPWMValue);
+      Serial.print(",");
+      Serial.print(dataToSend.switch1);
+      Serial.print(",");
+      Serial.print(dataToSend.switch2);
+      Serial.print(",");
+      Serial.println(dataToSend.switch3);
+
+      // Actualizar el estado de los interruptores
+      lastSwitchState1 = switchState1;
+      lastSwitchState2 = switchState2;
+      lastSwitchState3 = switchState3;
+
+      paqueteEnviadoRecientemente = millis();
+      digitalWrite(LED_LORA, LOW);  // Apagar LED después de la transmisión
+    }
+  }
+  lastPotPWMValue = controlPWMPot;
+  lastPotValue = controlPot;
+}
+
+void receiveSensorData() {
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    digitalWrite(LED_LORA, HIGH);  // Encender LED cuando recibimos datos
+    String receivedData = "";
+    while (LoRa.available()) {
+      receivedData += (char)LoRa.read();
+    }
+    Serial.print("Datos recibidos: ");
+    Serial.println(receivedData);
+
+    // Verificar si el paquete contiene el formato correcto "R:xx.xxV"
+    if (receivedData.startsWith("R:")) {
+      // Eliminar los caracteres no deseados (como "R:" y "V") antes de convertir a flotante
+      receivedData.replace("R:", "");  // Eliminar "R:"
+      receivedData.replace("V", "");   // Eliminar "V"
+
+      // Intentar convertir el valor de voltaje
+      receivedVoltage = receivedData.toFloat();
+      Serial.print("Voltaje recibido: ");
+      Serial.println(receivedVoltage);
+
+    }
+    digitalWrite(LED_LORA, LOW);  // Apagar LED después de recibir datos
+  }
+}
+
+void updateLCD() {
+  static unsigned long lastUpdateLCD = 0;
+  const unsigned long updateInterval = 5000; // 5 segundos
+
+  if (millis() - lastUpdateLCD >= updateInterval) {
+    lastUpdateLCD = millis();
+  
+    float voltajeRealsky = receivedVoltage;
+    // Mapeo de voltaje a nivel de batería
+    String nivelsky;
+    if (voltajeRealsky < 10.0) {
+      nivelsky = "LOW B";
+    } else if (voltajeRealsky >= 10.7 && voltajeRealsky < 11.3) {
+      nivelsky = "25%";
+    } else if (voltajeRealsky >= 11.3 && voltajeRealsky < 11.9) {
+      nivelsky = "50%";
+    } else if (voltajeRealsky >= 11.9 && voltajeRealsky < 12.6) {
+      nivelsky = "75%";
+    } else {
+      nivelsky = "100%";
+    }
+
+    // Solo actualiza si hay cambios para evitar parpadeo
+    static String ultimoNivelsky = "";
+    if (nivelsky != ultimoNivelsky) {
+      lcd.setCursor(0, 0); // Primera línea para SKYM5
+      lcd.print("SKYM5: ");
+      lcd.print(nivelsky);
+      lcd.print("     "); // Borra caracteres adicionales
+      ultimoNivelsky = nivelsky;
+    }
+  }
+}
+
+void readBatteryVoltage() {
+  static unsigned long lastUpdateLCD = 0;
+  const unsigned long updateInterval = 5000; // 5 segundos
+
+  if (millis() - lastUpdateLCD >= updateInterval) {
+    lastUpdateLCD = millis();
+    
+    int valorSensor = analogRead(pinSensorVoltaje);
+    float voltajeReal = (valorSensor / 198.0) * 5.0;
+
+    // Mapeo de voltaje a nivel de batería
+    String nivel;
+    if (voltajeReal < 7.0) {
+      nivel = "LOW B";
+    } else if (voltajeReal >= 7.3 && voltajeReal < 7.7) {
+      nivel = "25%";
+    } else if (voltajeReal >= 7.7 && voltajeReal < 8.1) {
+      nivel = "50%";
+    } else if (voltajeReal >= 8.1 && voltajeReal < 8.4) {
+      nivel = "75%";
+    } else {
+      nivel = "100%";
+    }
+
+    // Solo actualiza si hay cambios para evitar parpadeo
+    static String ultimoNivel = "";
+    if (nivel != ultimoNivel) {
+      lcd.setCursor(0, 1); // Segunda línea para CONTROL
+      lcd.print("CONTROL: ");
+      lcd.print(nivel);
+      lcd.print("     "); // Borra caracteres adicionales
+      ultimoNivel = nivel;
+    }
+  }
+}
